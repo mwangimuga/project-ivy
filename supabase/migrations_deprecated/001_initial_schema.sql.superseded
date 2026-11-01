@@ -1,0 +1,156 @@
+-- ============================================================
+-- Project Ivy — Initial Database Schema
+-- Run this in: Supabase Dashboard → SQL Editor
+-- ============================================================
+
+-- Enable UUID generation
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ── Profiles (extends Supabase auth.users) ─────────────────
+CREATE TABLE IF NOT EXISTS profiles (
+  id               UUID REFERENCES auth.users(id) ON DELETE CASCADE PRIMARY KEY,
+  username         TEXT UNIQUE NOT NULL,
+  full_name        TEXT NOT NULL,
+  role             TEXT NOT NULL CHECK (role IN ('super_agent','project_manager','landlord','maintenance','client')),
+  email            TEXT NOT NULL,
+  must_change_pw   BOOLEAN DEFAULT FALSE,
+  created_at       TIMESTAMPTZ DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ── Properties ──────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS properties (
+  id           UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+  name         TEXT NOT NULL,
+  address      TEXT NOT NULL,
+  type         TEXT NOT NULL CHECK (type IN ('apartment','student_housing','commercial','land','airbnb')),
+  status       TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available','occupied','pending')),
+  landlord_id  UUID REFERENCES profiles(id) ON DELETE SET NULL,
+  rent         NUMERIC(12,2) NOT NULL,
+  rating       NUMERIC(3,1) DEFAULT 4.5,
+  details      JSONB DEFAULT '{}',
+  media_urls   TEXT[] DEFAULT '{}',
+  glb_url      TEXT,
+  description  TEXT,
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ── Leases ──────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS leases (
+  id           UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+  client_id    UUID REFERENCES profiles(id) ON DELETE CASCADE,
+  property_id  UUID REFERENCES properties(id) ON DELETE CASCADE,
+  start_date   DATE NOT NULL,
+  end_date     DATE NOT NULL,
+  rent_amount  NUMERIC(12,2) NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','expired','terminated')),
+  balance      NUMERIC(12,2) DEFAULT 0, -- negative = credit
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ── Ledger ──────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ledger (
+  id              UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+  user_id         UUID REFERENCES profiles(id) ON DELETE CASCADE,
+  type            TEXT NOT NULL CHECK (type IN ('payment','withdrawal','credit')),
+  amount          NUMERIC(12,2) NOT NULL,
+  description     TEXT,
+  system_cut      NUMERIC(12,2) DEFAULT 0,
+  landlord_share  NUMERIC(12,2) DEFAULT 0,
+  tier            INTEGER CHECK (tier IN (1,2,3)),
+  paystack_ref    TEXT,
+  created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ── Maintenance Tickets ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS tickets (
+  id           UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+  title        TEXT NOT NULL,
+  description  TEXT,
+  property_id  UUID REFERENCES properties(id) ON DELETE CASCADE,
+  unit         TEXT,
+  client_id    UUID REFERENCES profiles(id),
+  assigned_to  UUID REFERENCES profiles(id),
+  priority     TEXT DEFAULT 'medium' CHECK (priority IN ('critical','high','medium','low')),
+  status       TEXT DEFAULT 'open' CHECK (status IN ('open','in_progress','resolved')),
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ── Messages ────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS messages (
+  id           UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+  sender_id    UUID REFERENCES profiles(id) ON DELETE CASCADE,
+  property_id  UUID REFERENCES properties(id),
+  stream       TEXT NOT NULL CHECK (stream IN ('maintenance','security','billing')),
+  content      TEXT NOT NULL,
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ============================================================
+-- ROW LEVEL SECURITY
+-- ============================================================
+ALTER TABLE profiles  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE properties ENABLE ROW LEVEL SECURITY;
+ALTER TABLE leases     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ledger     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tickets    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE messages   ENABLE ROW LEVEL SECURITY;
+
+-- Helper: get current user role
+CREATE OR REPLACE FUNCTION get_role() RETURNS TEXT AS $$
+  SELECT role FROM profiles WHERE id = auth.uid();
+$$ LANGUAGE SQL SECURITY DEFINER;
+
+-- ── Super Agent: full access ─────────────────────────────────
+CREATE POLICY "sa_all_profiles"    ON profiles    FOR ALL USING (get_role()='super_agent');
+CREATE POLICY "sa_all_properties"  ON properties  FOR ALL USING (get_role()='super_agent');
+CREATE POLICY "sa_all_leases"      ON leases      FOR ALL USING (get_role()='super_agent');
+CREATE POLICY "sa_all_ledger"      ON ledger      FOR ALL USING (get_role()='super_agent');
+CREATE POLICY "sa_all_tickets"     ON tickets     FOR ALL USING (get_role()='super_agent');
+CREATE POLICY "sa_all_messages"    ON messages    FOR ALL USING (get_role()='super_agent');
+
+-- ── Profiles ────────────────────────────────────────────────
+CREATE POLICY "own_profile"        ON profiles FOR SELECT USING (id = auth.uid());
+CREATE POLICY "pm_read_profiles"   ON profiles FOR SELECT USING (get_role() IN ('project_manager','maintenance'));
+
+-- ── Properties ──────────────────────────────────────────────
+CREATE POLICY "all_read_properties"  ON properties FOR SELECT USING (auth.role() = 'authenticated');
+CREATE POLICY "landlord_own_props"   ON properties FOR ALL   USING (landlord_id = auth.uid());
+CREATE POLICY "pm_manage_properties" ON properties FOR ALL   USING (get_role() = 'project_manager');
+
+-- ── Leases ──────────────────────────────────────────────────
+CREATE POLICY "client_own_lease"   ON leases FOR SELECT USING (client_id = auth.uid());
+CREATE POLICY "pm_all_leases"      ON leases FOR ALL    USING (get_role() = 'project_manager');
+CREATE POLICY "landlord_leases"    ON leases FOR SELECT USING (
+  property_id IN (SELECT id FROM properties WHERE landlord_id = auth.uid())
+);
+
+-- ── Ledger ──────────────────────────────────────────────────
+CREATE POLICY "own_ledger"         ON ledger FOR SELECT USING (user_id = auth.uid());
+CREATE POLICY "pm_all_ledger"      ON ledger FOR SELECT USING (get_role() = 'project_manager');
+CREATE POLICY "insert_own_ledger"  ON ledger FOR INSERT WITH CHECK (user_id = auth.uid());
+
+-- ── Tickets ─────────────────────────────────────────────────
+CREATE POLICY "all_read_tickets"   ON tickets FOR SELECT USING (auth.role() = 'authenticated');
+CREATE POLICY "client_create"      ON tickets FOR INSERT WITH CHECK (client_id = auth.uid());
+CREATE POLICY "assigned_update"    ON tickets FOR UPDATE USING (
+  assigned_to = auth.uid() OR get_role() IN ('project_manager','super_agent')
+);
+
+-- ── Messages ────────────────────────────────────────────────
+CREATE POLICY "all_read_messages"  ON messages FOR SELECT USING (auth.role() = 'authenticated');
+CREATE POLICY "insert_own_msg"     ON messages FOR INSERT WITH CHECK (sender_id = auth.uid());
+
+-- ============================================================
+-- SEED: Super Agent (run AFTER creating auth user in dashboard)
+-- Replace 'YOUR-AUTH-USER-UUID' with the UUID from auth.users
+-- ============================================================
+-- INSERT INTO profiles (id, username, full_name, role, email, must_change_pw)
+-- VALUES (
+--   'YOUR-AUTH-USER-UUID',
+--   'mark',
+--   'Mark Odhiambo',
+--   'super_agent',
+--   'mark@ivy.co.ke',
+--   TRUE
+-- );
